@@ -246,7 +246,7 @@ void square_unwrapped()
  			}
  			sum = _mm_hadd_ps(sum, sum);
  			sum = _mm_hadd_ps(sum, sum);
- 			_mm_store_ss(&temp_train[i], sum);
+ 			_mm_store_ss(&dist[i][j], sum);
  			dist[i][j] += sumTemp;
  		}
  		//dist[i][j] = sqrtf(temp_test[i] + temp_train[j] - 2 * sum);

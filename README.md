@@ -3,6 +3,6 @@
 
 See branch Master for initial serial algorithm
 
-See branch MFCC for MFCC parallel codes
+See branch MFCC for MFCC parallel codes (with prefix final1)
 
-See branch KNN for KNN parallel codes
+See branch KNN for KNN parallel codes (with prefix final2)

@@ -1,11 +1,12 @@
-﻿#include<string>
-#include<windows.h>
-#include <xmmintrin.h> //SSE
-#include <immintrin.h> //SVML
+#include<string>
+#include<cmath>
+#include <sys/time.h>
+#include <arm_neon.h>
 #include <algorithm>
 //#include<mpi.h>
-#include"wav.h"
+#include"wav_arm.h"
 #define TRAINNUM 1
+#define INTERVAL 10000
 using namespace std;
 typedef long long ll;
 const double pi = 3.14159265358979323846;
@@ -14,7 +15,7 @@ int length_frame = 512; //帧长，由于要做傅里叶变换，必须为2的�
 int log_length = 9;
 const int number_filterbanks = 26;//过滤器数量，最终得到3*number_filterbanks维的特征数据
 
-ll head, tail, freq;
+timeval tv_begin, tv_end;
 double _time = 0;
 int counter = 0;
 
@@ -22,7 +23,7 @@ void FFT(int length, float* Xr, double* Xi)
 {
 	//int log_length = (int)(log((double)length) / log(2.0));
 	//此处使用openMP进行并行化，记得加锁！
-	//#pragma omp parallel for num_threads(2)
+	//#pragma omp parallel for num_threads(4)
 	for (int i = 0; i < length; i++)
 	{
 		int j = 0;
@@ -41,47 +42,16 @@ void FFT(int length, float* Xr, double* Xi)
 		int L = (int)pow(2.0, i);
 		for (int j = 0; j < length - 1; j += 2 * L)
 		{
-			if (L < 4)
+			for (int k = 0; k < L; k++)
 			{
-				for (int k = 0; k < L; k++)
-				{
-					double argument = -pi * k / L;
-					double xr = Xr[j + k + L] * cos(argument) - Xi[j + k + L] * sin(argument);
-					double xi = Xr[j + k + L] * sin(argument) + Xi[j + k + L] * cos(argument);
+				double argument = -pi * k / L;
+				double xr = Xr[j + k + L] * cos(argument) - Xi[j + k + L] * sin(argument);
+				double xi = Xr[j + k + L] * sin(argument) + Xi[j + k + L] * cos(argument);
 
-					Xr[j + k + L] = Xr[j + k] - xr;
-					Xi[j + k + L] = Xi[j + k] - xi;
-					Xr[j + k] = Xr[j + k] + xr;
-					Xi[j + k] = Xi[j + k] + xi;
-				}
-			}
-			else
-			{
-				//#pragma omp parallel for num_threads(2)
-				for (int k = 0; k < L; k += 4)
-				{
-					__m128 arg = _mm_set_ps(-pi * (k + 3) / L, -pi * (k + 2) / L, -pi * (k + 1) / L, -pi * k / L);
-					__m128 argSin = _mm_sin_ps(arg);
-					__m128 argCos = _mm_cos_ps(arg);
-					__m128 Xr_v = _mm_loadu_ps(Xr + j + k + L);
-					__m128 Xi_v = _mm_loadu_ps(Xi + j + k + L);
-					__m128 first = _mm_mul_ps(Xr_v, argCos);
-					__m128 sec = _mm_mul_ps(Xi_v, argSin);
-					__m128 xr_v = _mm_sub_ps(first, sec);
-					first = _mm_mul_ps(Xr_v, argSin);
-					sec = _mm_mul_ps(Xi_v, argCos);
-					__m128 xi_v = _mm_add_ps(first, sec);
-					__m128 Xr_front = _mm_loadu_ps(Xr + j + k);
-					__m128 Xi_front = _mm_loadu_ps(Xi + j + k);
-					__m128 temp_r = _mm_sub_ps(Xr_front, xr_v);
-					_mm_storeu_ps(Xr + j + k + L, temp_r);
-					__m128 temp_i = _mm_sub_ps(Xi_front, xi_v);
-					_mm_storeu_ps(Xi + j + k + L, temp_i);
-					temp_r = _mm_add_ps(Xr_front, xr_v);
-					_mm_storeu_ps(Xr + j + k, temp_r);
-					temp_i = _mm_add_ps(Xi_front, xi_v);
-					_mm_storeu_ps(Xi + j + k, temp_i);
-				}
+				Xr[j + k + L] = Xr[j + k] - xr;
+				Xi[j + k + L] = Xi[j + k] - xi;
+				Xr[j + k] = Xr[j + k] + xr;
+				Xi[j + k] = Xi[j + k] + xi;
 			}
 		}
 	}
@@ -146,37 +116,16 @@ void DCT(int length, float* X)
 {
 	float* temp = new float[length];
 	//openMP
-	//#pragma omp parallel for //num_threads(1)
+	//#pragma omp parallel for num_threads(6)
 	for (int k = 0; k < length; k++)
 	{
-		//double sum = 0;
+		double sum = 0;
 		//SIMD
-		//for (int n = 0; n < length; n++)
-		//{
-		//	sum += ((k == 0) ? (sqrt(0.5)) : (1)) * X[n] * cos(pi * (n + 0.5) * k / length);
-		//}
-		//temp[k] = sum * sqrt(2.0 / length);
-
-		int n = 0;
-		float tempSum = 0;
-		for(;(length-n)&3;++n)
-			tempSum += X[n] * cos(pi * (n + 0.5) * k / length);
-		__m128 sumVec = _mm_set1_ps(0);
-		__m128 c = _mm_set1_ps(pi * k / length);
-		for (;n < length;n += 4)
+		for (int n = 0; n < length; n++)
 		{
-			__m128 temp1 = _mm_loadu_ps(&X[n]);
-			__m128 temp2 = _mm_set_ps(n + 3.5, n + 2.5, n + 1.5, n + 0.5);
-			temp2 = _mm_mul_ps(c, temp2);
-			temp2 = _mm_cos_ps(temp2);
-			temp1 = _mm_mul_ps(temp1, temp2);
-			sumVec = _mm_add_ps(sumVec, temp1);
+			sum += ((k == 0) ? (sqrt(0.5)) : (1)) * X[n] * cos(pi * (n + 0.5) * k / length);
 		}
-		sumVec = _mm_hadd_ps(sumVec, sumVec);
-		sumVec = _mm_hadd_ps(sumVec, sumVec);
-		_mm_store_ss(&temp[k], sumVec);
-		temp[k] += tempSum;
-		temp[k] *= sqrt(2.0 / length);
+		temp[k] = sum * sqrt(2.0 / length);
 	}
 	temp[0] *= sqrt(0.5);
 	memcpy(X, temp, length * sizeof(float));
@@ -199,40 +148,37 @@ void processClip(
 	//float* frequency_boundary = new float[number_filterbanks + 2];//滤波器边界值
 	float* actual_boundary = new float[number_filterbanks + 2];//实际滤波器边界频率
 	//这里可以添加SIMD，但意义似乎不大？
-	//#pragma omp parallel for //num_threads(8)
-	//for (int i = 0; i < number_filterbanks + 2; i++)
-	//{
-	//	frequency_boundary[i] = min_Mels_frequency + interval * i;
-	//}
+	#pragma omp parallel for num_threads(8)
+	for (int i = 0; i < number_filterbanks + 2; i++)
+	{
+		actual_boundary[i] = min_Mels_frequency + interval * i;
+		actual_boundary[i] = Mel_Scale(-1, actual_boundary[i]);
+	}
 
 	//SSE
-	int i = 0;
-	__m128 intv_vector = _mm_set_ps1(interval);
-	__m128 minMel_vector = _mm_set_ps1(min_Mels_frequency);
-	for (;i < number_filterbanks + 2 && ((number_filterbanks + 2 - i) & 3);++i)
-	{
-		float frequency_boundary = min_Mels_frequency + interval * i;
-		actual_boundary[i] = Mel_Scale(-1, frequency_boundary);
-	}
-	for (;i < number_filterbanks + 2;i += 4)
-	{
-		__m128 i_vector = _mm_set_ps(i + 3, i + 2, i + 1, i);
-		__m128 adder2 = _mm_mul_ps(intv_vector, i_vector);
-		adder2 = _mm_add_ps(minMel_vector, adder2);
-		//_mm_storeu_ps(&frequency_boundary[i], adder2);
-		__m128 diver = _mm_set1_ps(1125);
-		__m128 subber = _mm_set1_ps(1);
-		__m128 mult = _mm_set1_ps(700);
-		adder2 = _mm_div_ps(adder2, diver);
-		adder2 = _mm_exp_ps(adder2);
-		adder2 = _mm_sub_ps(adder2, subber);
-		adder2 = _mm_mul_ps(mult, adder2);
-		_mm_storeu_ps(&actual_boundary[i], adder2);
-	}
+	// int i = 0;
+	// float32x4_t intv_vector = vmovq_n_f32(interval);
+	// float32x4_t minMel_vector = vmovq_n_f32(min_Mels_frequency);
+	// for (;i < number_filterbanks + 2 && ((number_filterbanks + 2 - i) & 3);++i)
+	// 	actual_boundary[i] = min_Mels_frequency + interval * i;
+	// for (;i < number_filterbanks + 2;i += 4)
+	// {
+	// 	float32x4_t i_vector;
+	// 	vsetq_lane_f32(i + 3, i_vector, 0);
+	// 	vsetq_lane_f32(i + 2, i_vector, 1);
+	// 	vsetq_lane_f32(i + 1, i_vector, 2);
+	// 	vsetq_lane_f32(i, i_vector, 3);
+	// 	float32x4_t adder2 = vmulq_f32(intv_vector, i_vector);
+	// 	adder2 = vaddq_f32(minMel_vector, adder2);
+	// 	vst1q_f32(&actual_boundary[i], adder2);
+	// }
+
+	// for(int m = 0;m<number_filterbanks + 2;m++)
+	// 	actual_boundary[m] = Mel_Scale(-1, actual_boundary[m]);
 
 	//在此处添加openMP指令
 	//#pragma omp parallel num_threads(8)
-	#pragma omp parallel for num_threads(4)
+	#pragma omp parallel for num_threads(8)
 	for (int i = 0; i < length_buffer - length_frame; i += stride)
 	{
 		float* frame = new float[length_frame];
@@ -260,17 +206,22 @@ void processClip(
 		
 		for (int j = 0; j < length_frame; j += 4)
 		{
-			__m128 front = _mm_loadu_ps(&data[i + j]);
-			__m128 back;
+			float32x4_t front = vld1q_f32(&data[i + j]);
+			float32x4_t back;
 			if (!i && !j)
-				back = _mm_set_ps(data[2], data[1], data[0], 0);
-			else back = _mm_loadu_ps(&data[i + j - 1]);
-			__m128 mult = _mm_set_ps1(0.95);//预加重因子γ
-			__m128 hamming = _mm_loadu_ps(&hammingWindow[j]);
-			back = _mm_mul_ps(mult, back);
-			front = _mm_sub_ps(front, back);
-			front = _mm_mul_ps(front, hamming);
-			_mm_storeu_ps(&frame[j], front);
+			{
+				vsetq_lane_f32(data[2], back, 3);
+				vsetq_lane_f32(data[1], back, 2);
+				vsetq_lane_f32(data[0], back, 1);
+				vsetq_lane_f32(0, back, 0);
+			}
+			else back = vld1q_f32(&data[i + j - 1]);
+			float32x4_t mult = vmovq_n_f32(0.95);//预加重因子γ
+			float32x4_t hamming = vld1q_f32(&hammingWindow[j]);
+			back = vmulq_f32(mult, back);
+			front = vsubq_f32(front, back);
+			front = vmulq_f32(front, hamming);
+			vst1q_f32(&frame[j], front);
 		}
 		//第二步：FFT
 		double* Xi = new double[length_frame];//虚部
@@ -279,7 +230,7 @@ void processClip(
 		//第三步：功率谱、梅尔频率及梅尔滤波
 		//注意：如果使用双声道数据，此处应改为i<length_frame / 2 + 1
 		//考虑使用SIMD+二分查找，但应该会增加内存IO开销
-		#pragma omp parallel for num_threads(2)
+		#pragma omp parallel for num_threads(8)
 		for (int i = 0; i < length_frame; i++)
 		{
 			double power = (frame[i] * frame[i] + Xi[i] * Xi[i]) / length_frame;//功率谱
@@ -312,17 +263,10 @@ void processClip(
 				filterbank[start_sort - 1] += power * (actual_boundary[end_sort] - frequency) / (actual_boundary[end_sort] - actual_boundary[start_sort]);
 		}
 		//取对数，SIMD
-		//#pragma omp parallel for// num_threads(8)
-		//for (int i = 0; i < number_filterbanks; i++)
-		//{
-		//	filterbank[i] = log(filterbank[i]);
-		//}
-
-		for (int i = 0;i < number_filterbanks;i+=4)
+		#pragma omp parallel for num_threads(8)
+		for (int i = 0; i < number_filterbanks; i++)
 		{
-			__m128 temp = _mm_loadu_ps(&filterbank[i]);
-			temp = _mm_log_ps(temp);
-			_mm_storeu_ps(&filterbank[i], temp);
+			filterbank[i] = log(filterbank[i]);
 		}
 		//第四步：离散余弦变换
 		DCT(number_filterbanks, filterbank);
@@ -332,7 +276,7 @@ void processClip(
 	//逐帧处理完毕，此处必须同步
 	//第五步：动态特征提取：一阶/二阶差分
 	// deltas，一阶差分
-	#pragma omp parallel num_threads(5)
+	#pragma omp parallel num_threads(8)
 	{
 		//此处添加openMP
 		#pragma omp for //num_threads(5)
@@ -347,16 +291,16 @@ void processClip(
 			//}
 
 			int j = 0;
-			__m128 div = _mm_set1_ps(2);
+			float32x4_t div = vmovq_n_f32(2);
 			for (;(number_filterbanks - j) & 3;++j)
 				feature_vector[i][number_filterbanks + j] = (feature_vector[next][j] - feature_vector[prev][j]) / 2;
 			for (;j < number_filterbanks;j += 4)
 			{
-				__m128 temp1 = _mm_loadu_ps(&feature_vector[next][j]);
-				__m128 temp2 = _mm_loadu_ps(&feature_vector[prev][j]);
-				temp1 = _mm_sub_ps(temp1, temp2);
-				temp1 = _mm_div_ps(temp1, div);
-				_mm_storeu_ps(&feature_vector[i][number_filterbanks + j], temp1);
+				float32x4_t temp1 = vld1q_f32(&feature_vector[next][j]);
+				float32x4_t temp2 = vld1q_f32(&feature_vector[prev][j]);
+				temp1 = vsubq_f32(temp1, temp2);
+				temp1 = vdivq_f32(temp1, div);
+				vst1q_f32(&feature_vector[i][number_filterbanks + j], temp1);
 			}
 		}
 
@@ -374,16 +318,16 @@ void processClip(
 			}*/
 
 			int j = number_filterbanks;
-			__m128 div = _mm_set1_ps(2);
+			float32x4_t div = vmovq_n_f32(2);
 			for (;(2 * number_filterbanks - j) & 3;++j)
 				feature_vector[i][number_filterbanks + j] = (feature_vector[next][j] - feature_vector[prev][j]) / 2;
 			for (;j < 2 * number_filterbanks;j += 4)
 			{
-				__m128 temp1 = _mm_loadu_ps(&feature_vector[next][j]);
-				__m128 temp2 = _mm_loadu_ps(&feature_vector[prev][j]);
-				temp1 = _mm_sub_ps(temp1, temp2);
-				temp1 = _mm_div_ps(temp1, div);
-				_mm_storeu_ps(&feature_vector[i][number_filterbanks + j], temp1);
+				float32x4_t temp1 = vld1q_f32(&feature_vector[next][j]);
+				float32x4_t temp2 = vld1q_f32(&feature_vector[prev][j]);
+				temp1 = vsubq_f32(temp1, temp2);
+				temp1 = vdivq_f32(temp1, div);
+				vst1q_f32(&feature_vector[i][number_filterbanks + j], temp1);
 			}
 		}
 	}
@@ -392,9 +336,7 @@ void processClip(
 
 int main()
 {
-	QueryPerformanceFrequency((LARGE_INTEGER*)&freq);
-	QueryPerformanceCounter((LARGE_INTEGER*)&head);
-	//QueryPerformanceCounter((LARGE_INTEGER*)&tail);
+	gettimeofday(&tv_begin, 0);
 
 	int comm_sz;
 	int my_rank;
@@ -406,30 +348,17 @@ int main()
 	//{
 		float* hammingWindow = new float[length_frame];
 		//此处使用openMP或SIMD
-		//#pragma omp parallel for num_threads(4)
-		//for (int j = 0; j < length_frame; j++)
-		//{
-		//	hammingWindow[j] = 0.54 - 0.46 * cos(2 * pi * j / (length_frame - 1));
-		//}
-
-		__m128 subber = _mm_set1_ps(0.54);
-		__m128 subbee = _mm_set1_ps(0.46);
-		__m128 mult1 = _mm_set1_ps(2 * pi / (length_frame - 1));
-		for (int j = 0; j < length_frame; j+=4)
+		#pragma omp parallel for num_threads(8)
+		for (int j = 0; j < length_frame; j++)
 		{
-			__m128 mult2 = _mm_set_ps(j + 3, j + 2, j + 1, j);
-			mult2 = _mm_mul_ps(mult1, mult2);
-			mult2 = _mm_cos_ps(mult2);
-			mult2 = _mm_mul_ps(subbee, mult2);
-			mult2 = _mm_sub_ps(subber, mult2);
-			_mm_storeu_ps(&hammingWindow[j], mult2);
+			hammingWindow[j] = 0.54 - 0.46 * cos(2 * pi * j / (length_frame - 1));
 		}
 
-		//此处添加openMP指令，限制线程数
+		// //此处添加openMP指令，限制线程数
 		//for (int n = 0;n < TRAINNUM;n++)
 		//{
 			int n = 0;
-			string dir_path = "D://数据//作业//并行//final1//final1//";
+			string dir_path = "";
 			string addr = dir_path + to_string(n) + ".wav";
 			Wav wav(addr.c_str());
 			number_feature_vectors[n] = (wav.length_buffer - length_frame) / stride + 1;
@@ -447,10 +376,9 @@ int main()
 		float(*feature_vector)[number_filterbanks * 3] = new float[numberFeatureVectors][number_filterbanks * 3];
 		processClip(data, feature_vector, hammingWindow,  length_buffer, nSamplesPerSec, numberFeatureVectors);
 	//}
-		QueryPerformanceCounter((LARGE_INTEGER*)&tail);
+		gettimeofday(&tv_end, 0);
 		string waddr = dir_path + to_string(n) + ".txt";
-		FILE* file;
-		fopen_s(&file, waddr.c_str(), "wt");
+		FILE* file = fopen(waddr.c_str(), "wt");
 
 		//将.wav的MFCC特征写入到文件中，每帧一行。每行78维数据。
 		for (int i = 0; i < number_feature_vectors[n]; i++)
@@ -458,6 +386,7 @@ int main()
 			for (int j = 0; j < 3 * number_filterbanks; j++)
 			{
 				fprintf(file, "%f ", feature_vector[i][j]);
+				//printf("%f\n", feature_vector[i][j]);
 			}
 			fprintf(file, "\n");
 		}
@@ -465,6 +394,6 @@ int main()
 		delete[] hammingWindow;
 		delete[] feature_vector;
 		//_time /= counter;
-		_time += (double)(tail - head) * 1000.0 / freq;
-		std::cout << _time << '\n';
+        _time += ((ll)tv_end.tv_sec - (ll)tv_begin.tv_sec)*1000.0 + ((ll)tv_end.tv_usec - (ll)tv_begin.tv_usec)/1000.0;
+    	cout<<_time<<'\t';
 }

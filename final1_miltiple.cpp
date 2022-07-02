@@ -4,7 +4,7 @@
 #include <immintrin.h> //SVML
 #include <algorithm>
 //#include<mpi.h>
-#include"wav.h"
+#include"wav_multiple.h"
 #define TRAINNUM 500
 using namespace std;
 typedef long long ll;
@@ -41,16 +41,47 @@ void FFT(int length, float* Xr, double* Xi)
 		int L = (int)pow(2.0, i);
 		for (int j = 0; j < length - 1; j += 2 * L)
 		{
-			for (int k = 0; k < L; k++)
+			if (L < 4)
 			{
-				double argument = -pi * k / L;
-				double xr = Xr[j + k + L] * cos(argument) - Xi[j + k + L] * sin(argument);
-				double xi = Xr[j + k + L] * sin(argument) + Xi[j + k + L] * cos(argument);
+				for (int k = 0; k < L; k++)
+				{
+					double argument = -pi * k / L;
+					double xr = Xr[j + k + L] * cos(argument) - Xi[j + k + L] * sin(argument);
+					double xi = Xr[j + k + L] * sin(argument) + Xi[j + k + L] * cos(argument);
 
-				Xr[j + k + L] = Xr[j + k] - xr;
-				Xi[j + k + L] = Xi[j + k] - xi;
-				Xr[j + k] = Xr[j + k] + xr;
-				Xi[j + k] = Xi[j + k] + xi;
+					Xr[j + k + L] = Xr[j + k] - xr;
+					Xi[j + k + L] = Xi[j + k] - xi;
+					Xr[j + k] = Xr[j + k] + xr;
+					Xi[j + k] = Xi[j + k] + xi;
+				}
+			}
+			else
+			{
+				//#pragma omp parallel for num_threads(2)
+				for (int k = 0; k < L; k += 4)
+				{
+					__m128 arg = _mm_set_ps(-pi * (k + 3) / L, -pi * (k + 2) / L, -pi * (k + 1) / L, -pi * k / L);
+					__m128 argSin = _mm_sin_ps(arg);
+					__m128 argCos = _mm_cos_ps(arg);
+					__m128 Xr_v = _mm_loadu_ps(Xr + j + k + L);
+					__m128 Xi_v = _mm_loadu_ps(Xi + j + k + L);
+					__m128 first = _mm_mul_ps(Xr_v, argCos);
+					__m128 sec = _mm_mul_ps(Xi_v, argSin);
+					__m128 xr_v = _mm_sub_ps(first, sec);
+					first = _mm_mul_ps(Xr_v, argSin);
+					sec = _mm_mul_ps(Xi_v, argCos);
+					__m128 xi_v = _mm_add_ps(first, sec);
+					__m128 Xr_front = _mm_loadu_ps(Xr + j + k);
+					__m128 Xi_front = _mm_loadu_ps(Xi + j + k);
+					__m128 temp_r = _mm_sub_ps(Xr_front, xr_v);
+					_mm_storeu_ps(Xr + j + k + L, temp_r);
+					__m128 temp_i = _mm_sub_ps(Xi_front, xi_v);
+					_mm_storeu_ps(Xi + j + k + L, temp_i);
+					temp_r = _mm_add_ps(Xr_front, xr_v);
+					_mm_storeu_ps(Xr + j + k, temp_r);
+					temp_i = _mm_add_ps(Xi_front, xi_v);
+					_mm_storeu_ps(Xi + j + k, temp_i);
+				}
 			}
 		}
 	}

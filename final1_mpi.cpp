@@ -1,11 +1,11 @@
-﻿#include<string>
+#include<string>
 #include<windows.h>
 #include <xmmintrin.h> //SSE
 #include <immintrin.h> //SVML
 #include <algorithm>
-//#include<mpi.h>
-#include"wav.h"
-#define TRAINNUM 1
+#include <mpi.h>
+#include "wav_multiple.h"
+#define TRAINNUM 256
 using namespace std;
 typedef long long ll;
 const double pi = 3.14159265358979323846;
@@ -18,7 +18,7 @@ ll head, tail, freq;
 double _time = 0;
 int counter = 0;
 
-void FFT(int length, float* Xr, double* Xi)
+void FFT(int length, float* Xr, float* Xi)
 {
 	//int log_length = (int)(log((double)length) / log(2.0));
 	//此处使用openMP进行并行化，记得加锁！
@@ -273,9 +273,9 @@ void processClip(
 			_mm_storeu_ps(&frame[j], front);
 		}
 		//第二步：FFT
-		double* Xi = new double[length_frame];//虚部
-		memset(Xi, 0, sizeof(double) * length_frame);
-		FFTSerial(length_frame, frame, Xi);
+		float* Xi = new float[length_frame];//虚部
+		memset(Xi, 0, sizeof(float) * length_frame);
+		FFT(length_frame, frame, Xi);
 		//第三步：功率谱、梅尔频率及梅尔滤波
 		//注意：如果使用双声道数据，此处应改为i<length_frame / 2 + 1
 		//考虑使用SIMD+二分查找，但应该会增加内存IO开销
@@ -399,72 +399,97 @@ int main()
 	int comm_sz;
 	int my_rank;
 	int number_feature_vectors[TRAINNUM];//每段音频的特征数量
-	//MPI_Init(NULL, NULL);
-	//MPI_Comm_size(MPI_COMM_WORLD, &comm_sz);
-	//MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
-	//if (my_rank == 0)
+	float hammingWindow[512];
+	MPI_Init(NULL, NULL);
+	MPI_Comm_size(MPI_COMM_WORLD, &comm_sz);
+	MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+	//float* hammingWindow = new float[length_frame];
+	//此处使用openMP或SIMD
+	//#pragma omp parallel for num_threads(4)
+	//for (int j = 0; j < length_frame; j++)
 	//{
-		float* hammingWindow = new float[length_frame];
-		//此处使用openMP或SIMD
-		//#pragma omp parallel for num_threads(4)
-		//for (int j = 0; j < length_frame; j++)
-		//{
-		//	hammingWindow[j] = 0.54 - 0.46 * cos(2 * pi * j / (length_frame - 1));
-		//}
+	//	hammingWindow[j] = 0.54 - 0.46 * cos(2 * pi * j / (length_frame - 1));
+	//}
 
-		__m128 subber = _mm_set1_ps(0.54);
-		__m128 subbee = _mm_set1_ps(0.46);
-		__m128 mult1 = _mm_set1_ps(2 * pi / (length_frame - 1));
-		for (int j = 0; j < length_frame; j+=4)
-		{
-			__m128 mult2 = _mm_set_ps(j + 3, j + 2, j + 1, j);
-			mult2 = _mm_mul_ps(mult1, mult2);
-			mult2 = _mm_cos_ps(mult2);
-			mult2 = _mm_mul_ps(subbee, mult2);
-			mult2 = _mm_sub_ps(subber, mult2);
-			_mm_storeu_ps(&hammingWindow[j], mult2);
-		}
+	__m128 subber = _mm_set1_ps(0.54);
+	__m128 subbee = _mm_set1_ps(0.46);
+	__m128 mult1 = _mm_set1_ps(2 * pi / (length_frame - 1));
+	for (int j = 0; j < length_frame; j += 4)
+	{
+		__m128 mult2 = _mm_set_ps(j + 3, j + 2, j + 1, j);
+		mult2 = _mm_mul_ps(mult1, mult2);
+		mult2 = _mm_cos_ps(mult2);
+		mult2 = _mm_mul_ps(subbee, mult2);
+		mult2 = _mm_sub_ps(subber, mult2);
+		_mm_storeu_ps(&hammingWindow[j], mult2);
+	}
 
+	if (my_rank == 0)
+	{
 		//此处添加openMP指令，限制线程数
-		//for (int n = 0;n < TRAINNUM;n++)
-		//{
-			int n = 0;
-			string dir_path = "D://数据//作业//并行//final1//final1//";
-			string addr = dir_path + to_string(n) + ".wav";
-			Wav wav(addr.c_str());
-			number_feature_vectors[n] = (wav.length_buffer - length_frame) / stride + 1;
-			//此处添加buffer、args、hammingWindow的发语句
-			//此处添加feature_vector的收语句
-		//}
-	//}
-	//else
-	//{
-		float* data = wav.buffer;
-		int length_buffer = wav.length_buffer;
-		int nSamplesPerSec = wav.waveformatex.SampleRate;
-		int numberFeatureVectors = number_feature_vectors[0];
-		//此处添加buffer、args、hammingWindow的收语句
-		float(*feature_vector)[number_filterbanks * 3] = new float[numberFeatureVectors][number_filterbanks * 3];
-		processClip(data, feature_vector, hammingWindow,  length_buffer, nSamplesPerSec, numberFeatureVectors);
-	//}
-		QueryPerformanceCounter((LARGE_INTEGER*)&tail);
-		string waddr = dir_path + to_string(n) + ".txt";
-		FILE* file;
-		fopen_s(&file, waddr.c_str(), "wt");
-
-		//将.wav的MFCC特征写入到文件中，每帧一行。每行78维数据。
-		for (int i = 0; i < number_feature_vectors[n]; i++)
+		int count = 0;
+		int label[TRAINNUM];
+		for (int n = 0;count < TRAINNUM;n++)
 		{
-			for (int j = 0; j < 3 * number_filterbanks; j++)
-			{
-				fprintf(file, "%f ", feature_vector[i][j]);
-			}
-			fprintf(file, "\n");
+			bool ok;
+			string dir_path = "D://数据//作业//并行//final1//final1//0//";
+			string addr = dir_path + to_string(n) + ".wav";
+			Wav wav(addr.c_str(), ok);
+			if (!ok) continue;
+			label[count] = n;
+			number_feature_vectors[count] = (wav.length_buffer - length_frame) / stride + 1;
+			//此处添加buffer、args、hammingWindow的发语句
+			int args[3] = { wav.length_buffer , wav.waveformatex.SampleRate , number_feature_vectors[count] };
+			MPI_Send(args, 3, MPI_INT, count % (comm_sz - 1) + 1, count + TRAINNUM, MPI_COMM_WORLD);
+			MPI_Send(wav.buffer, wav.length_buffer, MPI_FLOAT, count % (comm_sz - 1) + 1, count, MPI_COMM_WORLD);
+			count++;
 		}
-		fclose(file);
-		delete[] hammingWindow;
-		delete[] feature_vector;
-		//_time /= counter;
-		_time += (double)(tail - head) * 1000.0 / freq;
-		std::cout << _time << '\n';
+	}
+	else
+	{
+		//float* data = wav.buffer;
+		//int length_buffer = wav.length_buffer;
+		//int nSamplesPerSec = wav.waveformatex.SampleRate;
+		//int numberFeatureVectors = number_feature_vectors[0];
+		for (int num = my_rank - 1;num < TRAINNUM;num += comm_sz - 1)
+		{
+			cout << my_rank << endl;
+			//此处添加buffer、args、hammingWindow的收语句
+			int args[3];
+			MPI_Recv(args, 3, MPI_INT, 0, num + TRAINNUM, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+			cout << "recerved"<<num<<endl;
+			int length_buffer = args[0];
+			int nSamplesPerSec = args[1];
+			int numberFeatureVectors = args[2];
+			float* data = new float[length_buffer];
+			MPI_Recv(data, length_buffer, MPI_FLOAT, 0, num, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+			cout << "recerved"<<endl;
+			float(*feature_vector)[number_filterbanks * 3] = new float[numberFeatureVectors][number_filterbanks * 3];
+			processClip(data, feature_vector, hammingWindow, length_buffer, nSamplesPerSec, numberFeatureVectors);
+			MPI_Request req;
+			//MPI_Isend(feature_vector, numberFeatureVectors * number_filterbanks * 3, MPI_FLOAT, 0, num, MPI_COMM_WORLD, &req);
+			//MPI_Send(feature_vector, numberFeatureVectors * number_filterbanks * 3, MPI_FLOAT, 0, num, MPI_COMM_WORLD);
+			string outpath = "D://数据//作业//并行//final1//final1//out//";
+			string waddr = outpath + to_string(num) + ".txt";
+			FILE* file;
+			fopen_s(&file, waddr.c_str(), "wt");
+
+			//将.wav的MFCC特征写入到文件中，每帧一行。每行78维数据。
+			for (int i = 0; i < numberFeatureVectors; i++)
+			{
+				for (int j = 0; j < 3 * number_filterbanks; j++)
+				{
+					fprintf(file, "%f ", feature_vector[i][j]);
+				}
+				fprintf(file, "\n");
+			}
+			fclose(file);
+			delete[] feature_vector;
+		}
+	}
+	QueryPerformanceCounter((LARGE_INTEGER*)&tail);
+	_time = (double)(tail - head) * 1000.0 / freq;
+	std::cout << "节点" << my_rank << "运行完成。共读取" << TRAINNUM << "段音频，耗时" << _time << '\n';
+	MPI_Finalize();
+	//delete[] hammingWindow;
 }

@@ -31,8 +31,7 @@ public:
     /************************************************************************/
     Wav(const char* path)
     {
-        FILE* file;
-        fopen_s(&file, path, "rb");
+        FILE* file = fopen(path, "rb");
         if (!file)
         {
             fprintf(stderr, "[Load] [%s not found]\n", path);
